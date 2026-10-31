@@ -1,0 +1,626 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Polyrhythmic Oscillator Engine</title>
+<style>
+body {
+    background:#1a1a2e;
+    color:white;
+    font-family:'Courier New',monospace;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    min-height:100vh;
+    margin:0;
+    gap:20px;
+}
+
+.panel {
+    background:#252540;
+    padding:25px;
+    border-radius:14px;
+    width:min(440px,85vw);
+}
+
+button {
+    padding:12px;
+    margin:4px;
+    border:0;
+    border-radius:7px;
+    cursor:pointer;
+    background:#444466;
+    color:white;
+    font-family:inherit;
+}
+
+button.active { background:#ff6b6b; }
+
+#startButton {
+    background:#2ecc71;
+    font-size:20px;
+    width:100%;
+    padding:18px;
+}
+
+input[type=range] {
+    width:100%;
+    accent-color:#ff6b6b;
+}
+
+label {
+    display:block;
+    margin-top:20px;
+}
+
+.value {
+    float:right;
+    color:#ff9a9a;
+}
+
+#status {
+    color:#aaa;
+    font-size:12px;
+    text-align:center;
+    margin-top:15px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="panel">
+
+<h2>ENGINE SYNTHESIZER</h2>
+
+<h3>Engine configuration</h3>
+
+<div id="presets">
+    <button data-preset="motorcycle">Motorcycle</button>
+    <button data-preset="v8">V8</button>
+    <button data-preset="formula">Formula</button>
+    <button data-preset="diesel">Diesel</button>
+</div>
+
+<label>
+    GAS PEDAL / THROTTLE
+    <span class="value" id="throttleValue">1.00x</span>
+</label>
+<input id="throttle" type="range"
+       min="0.1" max="4" step="0.01" value="1">
+
+<label>
+    NUMBER OF VOICES
+    <span class="value" id="voicesValue">15</span>
+</label>
+<input id="voices" type="range"
+       min="1" max="97" value="15">
+
+<label>
+    HIGH VOICE SOFTNESS
+    <span class="value" id="softnessValue">1.00</span>
+</label>
+<input id="softness" type="range"
+       min="0" max="4" step="0.01" value="1">
+
+<label>
+    PRIME / LINEAR DISTRIBUTION
+    <span class="value" id="distributionValue">100%</span>
+</label>
+<input id="distribution" type="range"
+       min="0" max="100" value="100">
+
+<br><br>
+
+<button id="startButton">START ENGINE</button>
+
+<div id="status">Engine ready</div>
+
+</div>
+
+<script>
+(() => {
+
+// =============================================
+// ORIGINAL MATHEMATICAL MODEL
+// =============================================
+
+const primes = [
+  2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
+  31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
+  73, 79, 83, 89, 97, 101, 103, 107, 109, 113,
+  127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
+  179, 181, 191, 193, 197, 199, 211, 223, 227, 229,
+  233, 239, 241, 251, 257, 263, 269, 271, 277, 281,
+  283, 293, 307, 311, 313, 317, 331, 337, 347, 349,
+  353, 359, 367, 373, 379, 383, 389, 397, 401, 409,
+  419, 421, 431, 433, 439, 443, 449, 457, 461, 463,
+  467, 479, 487, 491, 499, 503, 509
+];
+
+const START_FREQUENCY = 1;
+const END_FREQUENCY = 97;
+
+const presets = {
+    motorcycle: {
+        voices:15,
+        softness:1,
+        distribution:100
+    },
+    v8: {
+        voices:32,
+        softness:1.5,
+        distribution:65
+    },
+    formula: {
+        voices:64,
+        softness:0.5,
+        distribution:0
+    },
+    diesel: {
+        voices:97,
+        softness:2,
+        distribution:100
+    }
+};
+
+// =============================================
+// STATE
+// =============================================
+
+let ctx = null;
+let master = null;
+let voices = [];
+let playing = false;
+let engineStartTime = 0;
+
+let settings = {
+    throttle:1,
+    voices:15,
+    softness:1,
+    distribution:100
+};
+
+const $ = id => document.getElementById(id);
+
+
+// =============================================
+// FREQUENCY DISTRIBUTION
+// =============================================
+
+// At 100%, this returns exactly primes[i].
+// At 0%, it returns your original linear interpolation.
+
+function frequencyBasis(i) {
+
+    const n = settings.voices;
+
+    const freqRatio = i / Math.max(1,n-1);
+
+    const linear =
+        START_FREQUENCY +
+        (END_FREQUENCY - START_FREQUENCY) * freqRatio;
+
+    const prime = primes[i];
+
+    const blend = settings.distribution / 100;
+
+    return linear * (1-blend) + prime * blend;
+}
+
+
+// =============================================
+// ORIGINAL GAIN EQUATION
+// =============================================
+
+// At softness=1, this is EXACTLY your original formula:
+//
+// 1 / (i/3 + primes[i]/30 + 1)
+//
+// Higher softness suppresses higher-index voices more.
+
+function calculateGain(i) {
+
+    return 1 / (
+        i * settings.softness / 3 +
+        primes[i] / 30 +
+        1
+    );
+}
+
+
+// =============================================
+// ORIGINAL FREQUENCY TRAJECTORY
+// =============================================
+
+function getTrajectory(i) {
+
+    const p = frequencyBasis(i);
+
+    return [
+        { t:0,   f:p*1.7 },
+        { t:1,   f:p*15-i },
+        { t:3,   f:p*4+i },
+        { t:4,   f:p*8-i },
+        { t:6,   f:p*6+i },
+        { t:200, f:p*19-i*8 }
+    ];
+}
+
+
+// Interpolate the trajectory at any elapsed time.
+// This allows the throttle to change without restarting
+// the oscillator or losing its position in the trajectory.
+
+function frequencyAt(points, elapsed) {
+
+    if (elapsed <= 0) return points[0].f;
+
+    for (let k=1; k<points.length; k++) {
+
+        if (elapsed <= points[k].t) {
+
+            const a = points[k-1];
+            const b = points[k];
+
+            const ratio =
+                (elapsed-a.t)/(b.t-a.t);
+
+            return a.f + (b.f-a.f)*ratio;
+        }
+    }
+
+    return points[points.length-1].f;
+}
+
+
+// Schedule the original frequency ramps, multiplied
+// by the current throttle.
+
+function scheduleTrajectory(voice, now, elapsed) {
+
+    const points = getTrajectory(voice.index);
+
+    const param = voice.osc.frequency;
+
+    const currentFrequency =
+        frequencyAt(points,elapsed) * settings.throttle;
+
+    param.cancelScheduledValues(now);
+
+    param.setValueAtTime(currentFrequency,now);
+
+    points.forEach(point => {
+
+        if (point.t > elapsed) {
+
+            const absoluteTime =
+                engineStartTime + point.t;
+
+            param.linearRampToValueAtTime(
+                point.f * settings.throttle,
+                absoluteTime
+            );
+        }
+    });
+}
+
+
+// =============================================
+// AUDIO INITIALIZATION
+// =============================================
+
+function initAudio() {
+
+    if (!ctx) {
+        ctx = new AudioContext();
+    }
+
+    if (ctx.state === "suspended") {
+        ctx.resume();
+    }
+}
+
+
+// =============================================
+// BUILD ENGINE
+// =============================================
+
+function buildEngine() {
+
+    stopEngine();
+
+    initAudio();
+
+    const now = ctx.currentTime;
+
+    engineStartTime = now;
+
+    master = ctx.createGain();
+
+    // Your original master gain calculation.
+    master.gain.setValueAtTime(
+        30.0 / settings.voices,
+        now
+    );
+
+    master.connect(ctx.destination);
+
+    for (let i=0; i<settings.voices; i++) {
+
+        const osc = ctx.createOscillator();
+
+        const gain = ctx.createGain();
+
+        osc.type = 'sine';
+
+        // Initial frequency from original model.
+        osc.frequency.setValueAtTime(
+            frequencyBasis(i)*1.7*settings.throttle,
+            now
+        );
+
+        // Individual voice gain.
+        gain.gain.setValueAtTime(
+            calculateGain(i),
+            now
+        );
+
+        osc.connect(gain);
+
+        gain.connect(master);
+
+        const voice = {
+            osc:osc,
+            gain:gain,
+            index:i
+        };
+
+        voices.push(voice);
+
+        // Schedule original frequency trajectory.
+        scheduleTrajectory(voice,now,0);
+
+        osc.start(now);
+    }
+
+    playing = true;
+
+    updateStatus();
+}
+
+
+// =============================================
+// LIVE THROTTLE
+// =============================================
+
+// Does not restart oscillators.
+// Preserves their position in the 200-second trajectory.
+
+function updateFrequencies() {
+
+    if (!playing) return;
+
+    const now = ctx.currentTime;
+
+    const elapsed = now-engineStartTime;
+
+    voices.forEach(voice => {
+
+        scheduleTrajectory(
+            voice,
+            now,
+            elapsed
+        );
+    });
+}
+
+
+// =============================================
+// LIVE GAIN
+// =============================================
+
+function updateGains() {
+
+    if (!playing) return;
+
+    const now = ctx.currentTime;
+
+    voices.forEach(voice => {
+
+        voice.gain.gain.setTargetAtTime(
+            calculateGain(voice.index),
+            now,
+            0.04
+        );
+    });
+}
+
+
+// =============================================
+// STOP ENGINE
+// =============================================
+
+function stopEngine() {
+
+    if (!ctx || !voices.length) {
+        playing = false;
+        return;
+    }
+
+    const now = ctx.currentTime;
+
+    const oldVoices = voices;
+
+    const oldMaster = master;
+
+    voices = [];
+    master = null;
+    playing = false;
+
+    let remaining = oldVoices.length;
+
+    oldVoices.forEach(voice => {
+
+        voice.gain.gain.cancelScheduledValues(now);
+
+        voice.gain.gain.setTargetAtTime(
+            0,now,0.03
+        );
+
+        voice.osc.onended = () => {
+
+            voice.osc.disconnect();
+            voice.gain.disconnect();
+
+            remaining--;
+
+            if (remaining === 0 && oldMaster) {
+                oldMaster.disconnect();
+            }
+        };
+
+        voice.osc.stop(now+0.15);
+    });
+
+    updateStatus();
+}
+
+
+// =============================================
+// INTERFACE
+// =============================================
+
+function refresh() {
+
+    $("throttleValue").textContent =
+        settings.throttle.toFixed(2)+"x";
+
+    $("voicesValue").textContent =
+        settings.voices;
+
+    $("softnessValue").textContent =
+        settings.softness.toFixed(2);
+
+    $("distributionValue").textContent =
+        settings.distribution+"%";
+
+    if (playing) {
+
+        updateFrequencies();
+        updateGains();
+
+        if (voices.length !== settings.voices) {
+            buildEngine();
+        }
+    }
+}
+
+function updateStatus() {
+
+    $("status").textContent = playing
+        ? `ENGINE RUNNING | ${settings.voices} VOICES`
+        : "ENGINE STOPPED";
+}
+
+
+// =============================================
+// CONTROLS
+// =============================================
+
+$("throttle").addEventListener("input",e => {
+
+    settings.throttle = Number(e.target.value);
+
+    refresh();
+});
+
+$("voices").addEventListener("input",e => {
+
+    settings.voices = Number(e.target.value);
+
+    refresh();
+});
+
+$("softness").addEventListener("input",e => {
+
+    settings.softness = Number(e.target.value);
+
+    refresh();
+});
+
+$("distribution").addEventListener("input",e => {
+
+    settings.distribution = Number(e.target.value);
+
+    refresh();
+});
+
+
+// =============================================
+// ENGINE PRESETS
+// =============================================
+
+document.querySelectorAll("[data-preset]").forEach(btn => {
+
+    btn.addEventListener("click",() => {
+
+        const p = presets[btn.dataset.preset];
+
+        settings.voices = p.voices;
+        settings.softness = p.softness;
+        settings.distribution = p.distribution;
+
+        $("voices").value = p.voices;
+        $("softness").value = p.softness;
+        $("distribution").value = p.distribution;
+
+        document.querySelectorAll("[data-preset]")
+            .forEach(b => b.classList.remove("active"));
+
+        btn.classList.add("active");
+
+        refresh();
+    });
+});
+
+
+// =============================================
+// START / STOP
+// =============================================
+
+$("startButton").addEventListener("click",() => {
+
+    if (!playing) {
+
+        initAudio();
+
+        buildEngine();
+
+        $("startButton").textContent = "STOP ENGINE";
+
+        $("startButton").style.background = "#e74c3c";
+
+    } else {
+
+        stopEngine();
+
+        $("startButton").textContent = "START ENGINE";
+
+        $("startButton").style.background = "#2ecc71";
+    }
+});
+
+
+// Initial configuration
+
+$("presets")
+    .querySelector('[data-preset="motorcycle"]')
+    .click();
+
+})();
+</script>
+
+</body>
+</html>
